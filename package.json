@@ -1,0 +1,14 @@
+{
+  "name": "voice-assistant",
+  "version": "1.0.0",
+  "description": "Hands-Free Voice-Based Email and Messaging Assistant",
+  "scripts": {
+    "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
+    "dev": "concurrently \"cd backend && npm run dev\" \"cd frontend && npm run dev\"",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

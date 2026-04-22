@@ -1,0 +1,89 @@
+/* stylelint-disable at-rule-no-unknown */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+/* stylelint-enable at-rule-no-unknown */
+
+/* ── Base ──────────────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  background-color: #05050a;
+  color: #d4d4e0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Custom scrollbar ───────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0b0b12; }
+::-webkit-scrollbar-thumb { background: #2a2a35; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #35353f; }
+
+/* ── Reusable component classes ─────────────────────────────────────────────── */
+@layer components {
+
+  /* Custom theme values written as plain CSS — linter-safe */
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2
+           text-white font-semibold text-sm
+           px-5 py-2.5 rounded-xl
+           transition-all duration-200
+           disabled:opacity-40 disabled:cursor-not-allowed;
+    background-color: #7c6dfa;
+  }
+  .btn-primary:hover    { background-color: #6b5ce7; }
+  .btn-primary:active   { transform: scale(0.98); }
+  .btn-primary:disabled { transform: none; }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2
+           text-gray-300 font-medium text-sm
+           px-5 py-2.5 rounded-xl
+           transition-all duration-200
+           disabled:opacity-40 disabled:cursor-not-allowed;
+    background-color: #202028;
+    border: 1px solid #35353f;
+  }
+  .btn-secondary:hover  { background-color: #2a2a35; color: #ffffff; }
+  .btn-secondary:active { transform: scale(0.98); }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2
+           text-gray-400 font-medium text-sm
+           px-3 py-2 rounded-lg
+           transition-all duration-150;
+  }
+  .btn-ghost:hover { background-color: #202028; color: #ffffff; }
+
+  .input-field {
+    @apply w-full text-white text-sm rounded-xl px-4 py-2.5
+           placeholder-gray-600
+           transition-all duration-150;
+    background-color: #18181f;
+    border: 1px solid #35353f;
+    outline: none;
+  }
+  .input-field:focus {
+    border-color: #7c6dfa;
+    box-shadow: 0 0 0 2px #7c6dfa40;
+  }
+
+  .card {
+    @apply rounded-2xl p-6;
+    background-color: #111119;
+    border: 1px solid #202028;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+}
