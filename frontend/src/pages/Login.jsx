@@ -87,8 +87,6 @@ export default function Login() {
           voices.find((v) => v.lang.startsWith('en'));
         if (voice) u.voice = voice;
 
-        setCdResponse(text); // only in CDAssistant, remove for Login
-
         // Estimate duration: ~80ms per word + 600ms buffer
         const wordCount      = text.trim().split(/\s+/).length;
         const estimatedMs    = wordCount * 80 + 600;
@@ -98,7 +96,7 @@ export default function Login() {
           if (!resolved) {
             resolved = true;
             // Extra buffer after speech ends before mic opens
-            setTimeout(resolve, 1500);
+            setTimeout(resolve, 900);
           }
         };
 
@@ -122,63 +120,44 @@ export default function Login() {
     new Promise((resolve, reject) => {
       if (!SpeechRecognitionAPI) { reject(new Error('not-supported')); return; }
       stopRecognition();
-
       const r = new SpeechRecognitionAPI();
-      r.lang            = 'en-IN';
-      r.continuous      = type === 'pin';
+      r.lang            = 'en-US';
+      r.continuous      = false;
       r.interimResults  = false;
-      r.maxAlternatives = 5;
+      r.maxAlternatives = 10;
       recognitionRef.current = r;
 
       let done = false;
       const finish = (fn) => {
-        if (!done) { done = true; clearTimeout(timer); clearTimeout(pinTimer); fn(); }
+        if (!done) { done = true; clearTimeout(timer); fn(); }
       };
 
       const timer = setTimeout(
         () => finish(() => {
-          try { r.abort(); } catch { /* ignore */ }
+          try { r.abort(); } catch {}
           reject(new Error('timeout'));
         }),
         timeoutMs
       );
 
-      let pinTimer = null;
-      let pinTranscript = '';
-
       r.onresult = (e) => {
-        if (type === 'pin') {
-          for (let i = e.resultIndex; i < e.results.length; i++) {
-            if (e.results[i].isFinal) {
-              pinTranscript += ' ' + e.results[i][0].transcript;
-            }
-          }
-          clearTimeout(pinTimer);
-          pinTimer = setTimeout(() => {
-            finish(() => {
-              try { r.abort(); } catch { /* ignore */ }
-              resolve([pinTranscript.trim()]);
-            });
-          }, 2000);
-        } else {
-          const alternatives = Array.from(e.results[0]).map((a) => a.transcript);
-          finish(() => resolve(alternatives));
-        }
+        const alternatives = Array.from(e.results[0]).map((a) => a.transcript);
+        finish(() => resolve(alternatives));
       };
 
-      r.onerror  = (e) => finish(() => reject(new Error(e.error)));
-
-      r.onend = () => {
-        if (type === 'pin' && pinTranscript) {
-          finish(() => resolve([pinTranscript.trim()]));
-        } else {
-          finish(() => reject(new Error('ended')));
+      r.onerror = (e) => {
+        if (e.error === 'not-allowed') {
+          setVError('Microphone access denied. Please allow microphone access and try again.');
         }
+        finish(() => reject(new Error(e.error)));
       };
 
+      r.onend = () => finish(() => reject(new Error('ended')));
+
+      const startDelay = type === 'pin' ? 1200 : 500;
       setTimeout(() => {
         try { r.start(); } catch (e) { finish(() => reject(e)); }
-      }, 500);
+      }, startDelay);
     });
 
   // ── Parse spoken PIN ──────────────────────────────────────────────────────
@@ -207,6 +186,96 @@ export default function Login() {
       .replace(/[^a-z0-9@._+\-]/g, '');*/
 
   // ── Main voice login flow ─────────────────────────────────────────────────────
+  const digitizeText = (text) => {
+    const tens    = { twenty:2, thirty:3, forty:4, fifty:5, sixty:6, seventy:7, eighty:8, ninety:9 };
+    const singles = { zero:'0',one:'1',two:'2',three:'3',four:'4',five:'5',six:'6',seven:'7',eight:'8',nine:'9',oh:'0',to:'2',too:'2',for:'4',ate:'8' };
+    return text.toLowerCase()
+      .replace(/\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\s+(one|two|three|four|five|six|seven|eight|nine)\b/g,
+        (_, t, s) => `${tens[t]}${singles[s]}`)
+      .replace(/\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b/g,
+        (m) => `${tens[m]}0`)
+      .replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine|oh|to|too|for|ate)\b/g,
+        (m) => singles[m] || m);
+  };
+
+  const spokenNumberToDigits = (text) => {
+    const map = {
+      zero: '0',
+      one: '1',
+      two: '2',
+      three: '3',
+      four: '4',
+      five: '5',
+      six: '6',
+      seven: '7',
+      eight: '8',
+      nine: '9',
+      oh: '0',
+      to: '2',
+      too: '2',
+      for: '4',
+      ate: '8'
+    };
+
+    return text
+      .toLowerCase()
+      .split(/\s+/)
+      .map(word => map[word] ?? word)
+      .join(' ');
+  };
+
+  const parseEmailCandidate = (text) => {
+    let result = spokenNumberToDigits(text);
+
+    result = result
+      .replace(/\s+at\s+/g, '@')
+      .replace(/\bat\b/g, '@')
+      .replace(/\s+dot\s+/g, '.')
+      .replace(/\bdot\b/g, '.')
+      .replace(/\s+period\s+/g, '.')
+      .replace(/\bperiod\b/g, '.');
+
+    result = result
+      .replace(/\s+/g, '')
+      .replace(/[^a-z0-9@._+\-]/g, '');
+
+    return result;
+  };
+
+  const collectEmail = async () => {
+    await speak(
+      "Please say your complete email address."
+    );
+
+    await speak(
+      "For example, satyasaisohan two one zero eight at gmail dot com."
+    );
+
+    setVStatus("Listening for email...");
+
+    const first = await listenOnce(25000);
+
+    await delay(1000);
+
+    const second = await listenOnce(25000);
+
+    const alternatives = [...first, ...second];
+
+    const candidates = alternatives
+      .map(parseEmailCandidate)
+      .filter(email =>
+        /^[a-z0-9._+\-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(email)
+      );
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    candidates.sort((a, b) => b.length - a.length);
+
+    return candidates[0];
+  };
+
   const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const startVoiceLogin = async () => {
@@ -216,111 +285,74 @@ export default function Login() {
     }
     setVError(''); setVStatus('');
 
-    // ── Step 1: Email ────────────────────────────────────────────────────────
-    // ── Step 1a: Username ──────────────────────────────────────────────────────
     updateVStep(VSTEP.EMAIL);
-    await speak("Please say your username — the part before the at symbol.");
-    await delay(700);
 
-    let username = '';
+    let normalisedEmail = '';
+
     try {
-      setVStatus('Listening for username…');
-      const alts = await listenOnce(15000);
-      username = (alts[0] || '')
-        .toLowerCase()
-        .trim()
-        .replace(/\s+/g, '')
-        .replace(/[^a-z0-9._+\-]/g, '');
+      normalisedEmail = await collectEmail();
     } catch {
-      await speak("I didn't catch that. Please try again.");
-      updateVStep(VSTEP.IDLE); setVStatus(''); return;
+      normalisedEmail = null;
     }
 
-    if (!username) {
-      await speak("I didn't get a username. Please try again.");
-      updateVStep(VSTEP.IDLE); setVStatus(''); return;
+    if (!normalisedEmail) {
+      await speak(
+        "I could not understand the email address. Please try again."
+      );
+
+      updateVStep(VSTEP.IDLE);
+      setVStatus('');
+      return;
     }
 
-    // ── Step 1b: Domain ────────────────────────────────────────────────────────
-    await speak(`Got it — ${username}. Now say your domain. For example: gmail dot com.`);
-    await delay(700);
-
-    let domain = '';
-    try {
-      setVStatus('Listening for domain…');
-      const alts = await listenOnce(15000);
-      const raw  = (alts[0] || '').toLowerCase().trim();
-      domain = raw
-        .replace(/\s+dot\s+/g, '.')
-        .replace(/\bdot\b/g, '.')
-        .replace(/\s+period\s+/g, '.')
-        .replace(/\s*\.\s*/g, '.')
-        .replace(/\s+/g, '')
-        .replace(/[^a-z0-9.\-]/g, '');
-    } catch {
-      await speak("I didn't catch the domain. Please try again.");
-      updateVStep(VSTEP.IDLE); setVStatus(''); return;
-    }
-
-    if (!domain || !domain.includes('.')) {
-      await speak("That doesn't look like a valid domain. Please try again.");
-      updateVStep(VSTEP.IDLE); setVStatus(''); return;
-    }
-
-    // ── Step 1c: Confirm ───────────────────────────────────────────────────────
-    const normalisedEmail = `${username}@${domain}`;
-    const spokenEmail     = `${username} at ${domain.replace(/\./g, ' dot ')}`;
+    // ── Confirm ───────────────────────────────────────────────────────────────
+    
+    const spokenEmail = normalisedEmail
+      .replace('@', ' at ')
+      .replace(/\./g, ' dot ');
 
     updateVStep(VSTEP.CONFIRM);
-    await speak(`Your email is ${spokenEmail}. Is that correct? Say yes or no.`);
-    await delay(500);
+
+    console.log("Recognized email:", normalisedEmail);
+    setVStatus(`Recognized: ${normalisedEmail}`);
+
+    await speak(`I heard ${spokenEmail}.`);
+    await speak("Is that correct? Say yes or no.");
 
     try {
-      const alts   = await listenOnce(8000);
+      const alts = await listenOnce(8000);
       const answer = (alts[0] || '').toLowerCase();
-      if (!/yes|yeah|yep|correct|right|sure|confirm|absolutely/.test(answer)) {
-        await speak("Let's try again.");
-        updateVStep(VSTEP.IDLE); setVStatus(''); return;
-      }
     } catch {
       await speak("I didn't hear a response. Please try again.");
       updateVStep(VSTEP.IDLE); setVStatus(''); return;
     }
 
-    // ── Step 2: PIN (unchanged — keep exactly as you have it) ─────────────────
-
-    // ── Step 3: PIN ──────────────────────────────────────────────────────────
+    // ── PIN ───────────────────────────────────────────────────────────────────
     updateVStep(VSTEP.PIN);
-    await speak("Now please say your Voice PIN.");
-    await delay(700);
-
+    await speak("Now say your 4-digit Voice PIN.");
+    await speak("Speak each digit clearly. Listening.");
     let pin = '';
     try {
       setVStatus('Listening for PIN…');
       const alternatives = await listenOnce(15000, 'pin');
-
       for (const alt of alternatives) {
-        const { data } = await api.post('/voice/parse-pin', { speech: alt });
-        if (data.success && data.pin) { pin = data.pin; break; }
+        const parsed = parseSpokenPin(alt);
+        if (parsed && parsed.length >= 4) { pin = parsed; break; }
       }
     } catch {
       await speak("I didn't catch your PIN. Please try again.");
       updateVStep(VSTEP.IDLE); setVStatus(''); return;
     }
-
     if (!pin || pin.length < 4) {
       await speak("I couldn't understand the PIN. Please try again.");
       updateVStep(VSTEP.IDLE); setVStatus(''); return;
     }
 
-    // ── Step 4: Verify ───────────────────────────────────────────────────────
+    // ── Verify ────────────────────────────────────────────────────────────────
     updateVStep(VSTEP.VERIFYING);
     setVStatus('Verifying…');
     try {
-      const { data } = await api.post('/auth/voice-login', {
-        email: normalisedEmail,
-        pin,
-      });
+      const { data } = await api.post('/auth/voice-login', { email: normalisedEmail, pin });
       if (data.success) {
         updateVStep(VSTEP.DONE);
         await speak(`Welcome back, ${data.user.name.split(' ')[0]}! Signing you in.`);
@@ -337,6 +369,7 @@ export default function Login() {
       updateVStep(VSTEP.IDLE); setVStatus('');
     }
   };
+
   const cancelVoiceLogin = () => {
     stopRecognition();
     if (window.speechSynthesis) window.speechSynthesis.cancel();

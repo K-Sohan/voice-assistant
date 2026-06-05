@@ -229,12 +229,14 @@ router.get('/email/:id', protect, async (req, res) => {
     res.json({
       success: true,
       email: {
-        id:      req.params.id,
-        from:    get('From'),
+        id:        req.params.id,
+        threadId:  detail.data.threadId || null,
+        messageId: get('Message-ID'),
+        from:      get('From'),
         to:      get('To'),
         subject: get('Subject') || '(No subject)',
         date:    get('Date'),
-        body:    body.replace(/\s+/g, ' ').trim().substring(0, 1500),
+        body:    body.replace(/\s+/g, ' ').trim().substring(0, 3000),
         snippet: detail.data.snippet || '',
       },
     });
@@ -333,6 +335,119 @@ router.delete('/disconnect', protect, async (req, res) => {
     res.json({ success: true, message: 'Gmail disconnected.' });
   } catch {
     res.status(500).json({ success: false, message: 'Failed to disconnect Gmail.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/gmail/reply
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/reply', protect, async (req, res) => {
+  try {
+    const { to, subject, body, messageId, threadId } = req.body;
+    if (!to || !subject || !body)
+      return res.status(400).json({ success: false, message: 'to, subject, and body are required.' });
+
+    const gmail   = await getGmailClient(req.user._id);
+    const profile = await Profile.findOne({ user: req.user._id });
+    const from    = profile.gmailTokens.connectedEmail;
+
+    const lines = [
+      `From: ${from}`,
+      `To: ${to}`,
+      `Subject: ${subject.startsWith('Re:') ? subject : `Re: ${subject}`}`,
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=utf-8',
+    ];
+    if (messageId) { lines.push(`In-Reply-To: ${messageId}`); lines.push(`References: ${messageId}`); }
+    lines.push('', body);
+
+    const encoded = Buffer.from(lines.join('\r\n'))
+      .toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    const params = { userId: 'me', requestBody: { raw: encoded } };
+    if (threadId) params.requestBody.threadId = threadId;
+
+    await gmail.users.messages.send(params);
+    res.json({ success: true, message: 'Reply sent successfully.' });
+  } catch (err) {
+    if (err.message === 'Gmail not connected')
+      return res.status(400).json({ success: false, message: 'Gmail not connected.' });
+    console.error('Reply error:', err);
+    res.status(500).json({ success: false, message: 'Failed to send reply.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/gmail/search?q=query
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/search', protect, async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q) return res.status(400).json({ success: false, message: 'Search query required.' });
+
+    const gmail   = await getGmailClient(req.user._id);
+    const list    = await gmail.users.messages.list({ userId: 'me', q, maxResults: 5 });
+    const messages = list.data.messages || [];
+
+    if (messages.length === 0) return res.json({ success: true, emails: [] });
+
+    const emails = await Promise.all(
+      messages.map(async (msg) => {
+        const detail  = await gmail.users.messages.get({
+          userId: 'me', id: msg.id, format: 'metadata',
+          metadataHeaders: ['From', 'Subject', 'Date'],
+        });
+        const headers = detail.data.payload?.headers || [];
+        const get     = (name) => headers.find((h) => h.name === name)?.value || '';
+        return {
+          id:       msg.id,
+          from:     get('From'),
+          subject:  get('Subject') || '(No subject)',
+          date:     get('Date'),
+          snippet:  detail.data.snippet || '',
+          isUnread: detail.data.labelIds?.includes('UNREAD') ?? false,
+        };
+      })
+    );
+    res.json({ success: true, emails });
+  } catch (err) {
+    if (err.message === 'Gmail not connected')
+      return res.status(400).json({ success: false, message: 'Gmail not connected.' });
+    console.error('Search error:', err);
+    res.status(500).json({ success: false, message: 'Failed to search emails.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUT /api/gmail/mark-read/:id
+// ─────────────────────────────────────────────────────────────────────────────
+router.put('/mark-read/:id', protect, async (req, res) => {
+  try {
+    const gmail = await getGmailClient(req.user._id);
+    await gmail.users.messages.modify({
+      userId:      'me',
+      id:          req.params.id,
+      requestBody: { removeLabelIds: ['UNREAD'] },
+    });
+    res.json({ success: true, message: 'Marked as read.' });
+  } catch (err) {
+    if (err.message === 'Gmail not connected')
+      return res.status(400).json({ success: false, message: 'Gmail not connected.' });
+    res.status(500).json({ success: false, message: 'Failed to mark as read.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/gmail/delete/:id  →  moves to trash
+// ─────────────────────────────────────────────────────────────────────────────
+router.delete('/delete/:id', protect, async (req, res) => {
+  try {
+    const gmail = await getGmailClient(req.user._id);
+    await gmail.users.messages.trash({ userId: 'me', id: req.params.id });
+    res.json({ success: true, message: 'Email moved to trash.' });
+  } catch (err) {
+    if (err.message === 'Gmail not connected')
+      return res.status(400).json({ success: false, message: 'Gmail not connected.' });
+    res.status(500).json({ success: false, message: 'Failed to delete email.' });
   }
 });
 

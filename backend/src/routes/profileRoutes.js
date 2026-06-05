@@ -96,7 +96,7 @@ router.post('/verify-pin', protect, async (req, res) => {
     if (valid) {
       return res.json({ success: true, message: 'Voice PIN verified. Assistant activated.' });
     }
-    return res.status(401).json({ success: false, message: 'Incorrect Voice PIN.' });
+    return res.json({ success: false, message: 'Incorrect Voice PIN.' });
   } catch (error) {
     console.error('Verify PIN error:', error);
     res.status(500).json({ success: false, message: 'Server error verifying Voice PIN.' });
