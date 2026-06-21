@@ -19,6 +19,24 @@ const ensureProfile = async (userId) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/auth/check-email
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/check-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ success: false, message: 'Email is required.' });
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) return res.json({ success: true, exists: false, authProvider: null });
+
+    return res.json({ success: true, exists: true, authProvider: user.authProvider });
+  } catch (error) {
+    console.error('Check email error:', error);
+    res.status(500).json({ success: false, message: 'Server error checking email.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/auth/register
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/register', async (req, res) => {
@@ -40,9 +58,15 @@ router.post('/register', async (req, res) => {
 
     const existing = await User.findOne({ email });
     if (existing) {
+      const providerMsg = existing.authProvider === 'google'
+        ? 'This email is registered with Google. Please continue with Google.'
+        : existing.authProvider === 'microsoft'
+        ? 'This email is registered with Microsoft.'
+        : 'An account with that email already exists. Please sign in.';
       return res.status(409).json({
         success: false,
-        message: 'An account with that email already exists.',
+        message: providerMsg,
+        authProvider: existing.authProvider,
       });
     }
 
@@ -59,6 +83,7 @@ router.post('/register', async (req, res) => {
         email: user.email,
         avatar: user.avatar,
         authProvider: user.authProvider,
+        createdAt: user.createdAt,
       },
     });
   } catch (error) {
@@ -91,6 +116,7 @@ router.post('/login', (req, res, next) => {
           email: user.email,
           avatar: user.avatar,
           authProvider: user.authProvider,
+          createdAt: user.createdAt,
         },
       });
     } catch (error) {
@@ -104,7 +130,7 @@ router.post('/login', (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get(
   '/google',
-  passport.authenticate('google', { scope: ['profile', 'email'] })
+  passport.authenticate('google', { scope: ['profile', 'email'], prompt: 'select_account' })
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,6 +180,7 @@ router.get('/me', protect, (req, res) => {
       email: req.user.email,
       avatar: req.user.avatar,
       authProvider: req.user.authProvider,
+      createdAt: req.user.createdAt,
     },
   });
 });
@@ -213,6 +240,7 @@ router.post('/voice-login', async (req, res) => {
         email:        user.email,
         avatar:       user.avatar,
         authProvider: user.authProvider,
+        createdAt:    user.createdAt,
       },
     });
   } catch (error) {
@@ -223,4 +251,19 @@ router.post('/voice-login', async (req, res) => {
     });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/auth/account
+// ─────────────────────────────────────────────────────────────────────────────
+router.delete('/account', protect, async (req, res) => {
+  try {
+    await Profile.findOneAndDelete({ user: req.user._id });
+    await User.findByIdAndDelete(req.user._id);
+    res.json({ success: true, message: 'Account deleted successfully.' });
+  } catch (error) {
+    console.error('Delete account error:', error);
+    res.status(500).json({ success: false, message: 'Server error deleting account.' });
+  }
+});
+
 module.exports = router;

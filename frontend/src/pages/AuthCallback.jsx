@@ -7,7 +7,7 @@ export default function AuthCallback() {
   const [searchParams] = useSearchParams();
   const navigate       = useNavigate();
   const { login }      = useAuth();
-  const handled        = useRef(false); // Prevent double execution in StrictMode
+  const handled        = useRef(false);
 
   useEffect(() => {
     if (handled.current) return;
@@ -21,25 +21,36 @@ export default function AuthCallback() {
       navigate(`/login?error=${encodeURIComponent(msg)}`, { replace: true });
       return;
     }
-
     if (!token) {
       navigate('/login?error=No+authentication+token+was+received.', { replace: true });
       return;
     }
 
-    // Temporarily store token so the api interceptor can use it
     localStorage.setItem('va_token', token);
 
     api
       .get('/auth/me')
       .then(({ data }) => {
-        if (data.success) {
-          login(token, data.user);
-          navigate('/dashboard', { replace: true });
-        } else {
+        if (!data.success) {
           localStorage.removeItem('va_token');
           navigate('/login?error=Failed+to+load+user+profile.', { replace: true });
+          return;
         }
+
+        // ── Verify the Google account matches what was typed before redirect ──
+        let expectedEmail = null;
+        try { expectedEmail = sessionStorage.getItem('expectedAuthEmail'); } catch {}
+        try { sessionStorage.removeItem('expectedAuthEmail'); } catch {}
+
+        if (expectedEmail && data.user.email?.toLowerCase() !== expectedEmail.toLowerCase()) {
+          localStorage.removeItem('va_token');
+          const msg = `You signed in with ${data.user.email}, but entered ${expectedEmail}. Please use the matching Google account, or continue with ${data.user.email} instead.`;
+          navigate(`/login?error=${encodeURIComponent(msg)}`, { replace: true });
+          return;
+        }
+
+        login(token, data.user);
+        navigate('/dashboard', { replace: true });
       })
       .catch(() => {
         localStorage.removeItem('va_token');

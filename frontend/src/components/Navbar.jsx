@@ -18,7 +18,6 @@ export default function Navbar() {
   return (
     <header className="sticky top-0 z-50 bg-dark-900/80 backdrop-blur-md border-b border-dark-600">
       <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
-        {/* Brand */}
         <Link to="/dashboard" className="flex items-center gap-2.5 group">
           <span className="text-2xl select-none">🎙️</span>
           <span className="font-bold text-white text-base tracking-tight group-hover:text-violet-light transition-colors">
@@ -26,11 +25,10 @@ export default function Navbar() {
           </span>
         </Link>
 
-        {/* Nav links */}
         <nav className="hidden sm:flex items-center gap-1">
           {[
             { path: '/dashboard', label: 'Dashboard', icon: '🏠' },
-            { path: '/profile',   label: 'Profile',   icon: '⚙️' },
+            { path: '/profile',   label: 'Profile',   icon: '👤' },
           ].map(({ path, label, icon }) => (
             <Link
               key={path}
@@ -47,7 +45,6 @@ export default function Navbar() {
           ))}
         </nav>
 
-        {/* User menu */}
         <div className="relative">
           <button
             onClick={() => setOpen((p) => !p)}
@@ -74,7 +71,7 @@ export default function Navbar() {
               </div>
               <div className="p-1">
                 <Link
-                  to="/profile"
+                  to="/settings"
                   onClick={() => setOpen(false)}
                   className="flex items-center gap-2 px-3 py-2 rounded-xl text-sm text-gray-300 hover:bg-dark-600 hover:text-white transition-colors"
                 >

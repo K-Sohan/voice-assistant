@@ -2,6 +2,9 @@ const express     = require('express');
 const router      = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
 // ── Smart email parser ────────────────────────────────────────────────────────
 const parseEmailFromSpeech = (text) => {
   let s = text.toLowerCase().trim();
@@ -95,6 +98,36 @@ router.post('/parse-pin', protect, (req, res) => {
     return res.json({ success: false, pin: null });
   }
   res.json({ success: true, pin });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/voice/transcribe-groq
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/transcribe-groq', protect, upload.single('audio'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No audio file provided.' });
+
+    const formData = new FormData();
+    formData.append('file', new Blob([req.file.buffer]), 'audio.webm');
+    formData.append('model', 'whisper-large-v3-turbo');
+    formData.append('language', 'en');
+
+    const groqResp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: formData,
+    });
+
+    const data = await groqResp.json();
+    if (!groqResp.ok) {
+      console.error('Groq transcription error:', data);
+      return res.status(500).json({ success: false, message: 'Transcription failed.' });
+    }
+    res.json({ success: true, text: (data.text || '').trim() });
+  } catch (err) {
+    console.error('transcribe-groq error:', err);
+    res.status(500).json({ success: false, message: 'Transcription failed.' });
+  }
 });
 
 module.exports = router;

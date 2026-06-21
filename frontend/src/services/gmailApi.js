@@ -50,6 +50,16 @@ const gmailApi = {
     return data;
   },
 
+  suggestReply: async (id) => {
+    const { data } = await api.post(`/gmail/suggest-reply/${id}`);
+    return data;
+  },
+
+  getContacts: async () => {
+    const { data } = await api.get('/gmail/contacts');
+    return data;
+  },
+
 };
 
 export default gmailApi;

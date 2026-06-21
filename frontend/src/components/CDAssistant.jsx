@@ -47,6 +47,7 @@ const MODE_CONFIG = {
 export default function CDAssistant({
   preferredLanguage = 'en-US',
   voicePinSet       = false,
+  voiceSpeed        = 1.0,
 }) {
   const navigate = useNavigate();
   const { logout } = useAuth();
@@ -67,8 +68,10 @@ export default function CDAssistant({
   const gmailRef        = useRef({ connected: false, email: '' });
   const logRef          = useRef([]);
   const inboxCacheRef   = useRef([]);
+  const contactsRef = useRef([]);
   const stopSpeakingRef = useRef(false);
   const lastReadEmailRef = useRef(null);
+  const voiceSpeedRef = useRef(voiceSpeed);
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
   const updateMode = (m) => { modeRef.current = m; setMode(m); };
@@ -95,8 +98,15 @@ export default function CDAssistant({
       gmailRef.current = { connected: data.connected, email: data.email || '' };
       setGmailConnected(data.connected);
       setGmailEmail(data.email || '');
+      if (data.connected) {
+        gmailApi.getContacts().then(({ contacts = [] }) => { contactsRef.current = contacts; }).catch(() => {});
+      }
     } catch { /* non-fatal */ }
   };
+
+  useEffect(() => {
+    voiceSpeedRef.current = voiceSpeed;
+  }, [voiceSpeed]);
 
   // ── Effects ──────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -108,6 +118,7 @@ export default function CDAssistant({
         window.speechSynthesis.getVoices()
       );
     }
+
     // Handle URL params from Gmail OAuth redirect
     const params = new URLSearchParams(window.location.search);
     if (params.get('gmail_connected')) {
@@ -174,7 +185,7 @@ export default function CDAssistant({
       setTimeout(() => {
         const u = new SpeechSynthesisUtterance(text);
         u.lang   = 'en-US';
-        u.rate   = 1.0;
+        u.rate   = Math.min(2.0, Math.max(0.5, Number(voiceSpeedRef.current) || 1.0));
         u.pitch  = 1.05;
         u.volume = 1.0;
 
@@ -190,11 +201,19 @@ export default function CDAssistant({
         const wordCount   = text.trim().split(/\s+/).length;
         const estimatedMs = wordCount * 80 + 600;
 
-        u.onend   = done;
-        u.onerror = done;
         setTimeout(done, estimatedMs + 1000);
 
         window.speechSynthesis.speak(u);
+
+        // Chrome Windows bug fix — prevent mid-utterance pause
+        const resumeTimer = setInterval(() => {
+          if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+        }, 1000);
+
+        const originalDone = done;
+        const wrappedDone = () => { clearInterval(resumeTimer); originalDone(); };
+        u.onend   = wrappedDone;
+        u.onerror = wrappedDone;
       }, 500);
     });
   // ── Stop current recognition safely ─────────────────────────────────────────
@@ -206,6 +225,70 @@ export default function CDAssistant({
   };
 
   // ── Single-shot listen (returns array of transcript alternatives) ────────────
+  const listenOnceGroq = (timeoutMs = 15000) =>
+    new Promise(async (resolve, reject) => {
+      try {
+        const stream   = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const actx     = new AudioContext();
+        const analyser = actx.createAnalyser();
+        actx.createMediaStreamSource(stream).connect(analyser);
+        analyser.fftSize = 512;
+        const buf = new Uint8Array(analyser.frequencyBinCount);
+
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus' : 'audio/webm';
+        const recorder = new MediaRecorder(stream, { mimeType });
+        const chunks   = [];
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+        let speaking = false, silenceStart = null, done = false;
+        const silenceThreshold = 1200;
+
+        const finish = () => {
+          if (done) return; done = true;
+          if (recorder.state !== 'inactive') recorder.stop();
+        };
+
+        const maxTimer = setTimeout(finish, timeoutMs);
+
+        const vad = () => {
+          if (done) return;
+          analyser.getByteFrequencyData(buf);
+          const vol = buf.reduce((s, v) => s + v, 0) / buf.length;
+          if (vol > 8) { speaking = true; silenceStart = null; }
+          else if (speaking) {
+            if (!silenceStart) silenceStart = Date.now();
+            if (Date.now() - silenceStart > silenceThreshold) { clearTimeout(maxTimer); finish(); return; }
+          }
+          requestAnimationFrame(vad);
+        };
+
+        recorder.onstop = async () => {
+          clearTimeout(maxTimer);
+          stream.getTracks().forEach(t => t.stop());
+          actx.close().catch(() => {});
+          if (!speaking || chunks.length === 0) { reject(new Error('no-speech')); return; }
+          const blob  = new Blob(chunks, { type: mimeType });
+          const fd    = new FormData();
+          fd.append('audio', blob, 'audio.webm');
+          try {
+            const token = localStorage.getItem('va_token');
+            const resp  = await fetch('/api/voice/transcribe-groq', {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${token}` },
+              body: fd,
+            });
+            const data = await resp.json();
+            if (data.success && data.text) resolve([data.text]);
+            else reject(new Error('empty'));
+          } catch { reject(new Error('stt-failed')); }
+        };
+
+        recorder.start(100);
+        requestAnimationFrame(vad);
+      } catch { reject(new Error('mic-error')); }
+    });
+
   const listenOnce = (type = 'command', timeoutMs = 15000) =>
     new Promise((resolve, reject) => {
       if (!SpeechRecognitionAPI) { reject(new Error('not-supported')); return; }
@@ -377,7 +460,9 @@ export default function CDAssistant({
       if (modeRef.current !== MODE.ACTIVE) break;
 
       try {
-        const alternatives = await listenOnce('command', 15000);
+        const alternatives = convCtxRef.current.step === 'compose_email'
+          ? await listenOnceGroq(15000)
+          : await listenOnce('command', 15000);
         silenceStreak = 0;
         const text = alternatives[0] || '';
         setTranscript(text);
@@ -385,18 +470,22 @@ export default function CDAssistant({
         updateMode(MODE.PROCESSING);
         await processCommand(text, alternatives);
         if (modeRef.current === MODE.WAKE || modeRef.current === MODE.IDLE) break;
-        // Mid-compose: give Chrome extra time to reset the mic before next listen
+       // Mid-compose: give Chrome extra time to reset the mic before next listen
         if (convCtxRef.current.step) {
-          await new Promise((r) => setTimeout(r, 900));
+          const longDelaySteps = ['compose_confirm', 'delete_confirm', 'reply_confirm', 'compose_recipient_confirm', 'ai_reply_confirm'];
+          const delay = longDelaySteps.includes(convCtxRef.current.step) ? 1800 : 900;
+          await new Promise((r) => setTimeout(r, delay));
           silenceStreak = 0; // mic delay is not user silence
         }
         updateMode(MODE.ACTIVE);
       } catch (err) {
         if (modeRef.current === MODE.WAKE || modeRef.current === MODE.IDLE) break;
         if (err.message === 'timeout' || err.message === 'ended') {
-          // Mid-compose: immediate onend is a mic reset, not silence — retry quietly
+         // Mid-compose: immediate onend is a mic reset, not silence — retry quietly
           if (err.message === 'ended' && convCtxRef.current.step) {
-            await new Promise((r) => setTimeout(r, 600));
+            const longDelaySteps = ['compose_confirm', 'delete_confirm', 'reply_confirm', 'compose_recipient_confirm', 'ai_reply_confirm'];
+            const delay = longDelaySteps.includes(convCtxRef.current.step) ? 1500 : 600;
+            await new Promise((r) => setTimeout(r, delay));
           } else {
             silenceStreak++;
             if (silenceStreak >= 2) {
@@ -489,7 +578,11 @@ export default function CDAssistant({
     }
 
     // ── Navigation ───────────────────────────────────────────────────────────
-    if (/(open|go to|take me to) (profile|settings)/.test(lower)) {
+    if (/(open|go to|take me to) (your )?settings/.test(lower)) {
+      const msg = "Opening settings.";
+      addLog('cd', msg); await speak(msg); navigate('/settings'); return;
+    }
+    if (/(open|go to|take me to) (your )?profile/.test(lower)) {
       const msg = "Opening your profile.";
       addLog('cd', msg); await speak(msg); navigate('/profile'); return;
     }
@@ -525,13 +618,13 @@ export default function CDAssistant({
     }
 
     // ── Mark as read ──────────────────────────────────────────────────────────
-    const markNumMap = { one:1, first:1, two:2, to:2, too:2, second:2, three:3, third:3, tree:3, four:4, for:4, fourth:4, five:5, fifth:5, file:5 };
-    const markMatch  = lower.match(/mark (?:email\s+|message\s+)?(?:number\s+)?(\d+|one|two|to|too|three|tree|four|for|five|file|first|second|third|fourth|fifth)\b.*?(?:as )?read/);
-    if (markMatch) {
-      const num = markNumMap[markMatch[1]] || parseInt(markMatch[1]);
-      if (num >= 1 && num <= 5) { await handleMarkAsRead(num); return; }
-    }
-    if (/mark (this |it )?(as )?read|mark (as )?read/.test(lower)) {
+    if (/\bmark\b/.test(lower) && /\b(read|red)\b/.test(lower)) {
+      const markNumMap = { one:1, first:1, two:2, to:2, too:2, second:2, three:3, third:3, tree:3, four:4, for:4, fourth:4, five:5, fifth:5, file:5 };
+      const numMatch   = lower.match(/\b(\d+|one|two|to|too|three|tree|four|for|five|file|first|second|third|fourth|fifth)\b/);
+      if (numMatch) {
+        const num = markNumMap[numMatch[1]] || parseInt(numMatch[1]);
+        if (num >= 1 && num <= 5) { await handleMarkAsRead(num); return; }
+      }
       await handleMarkAsRead(); return;
     }
 
@@ -547,8 +640,8 @@ export default function CDAssistant({
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
-    const fromMatch    = lower.match(/(?:find|search|look for|show) (?:emails?|messages?) (?:from|by) (.+)/);
-    const aboutMatch   = lower.match(/(?:find|search|look for|show) (?:emails?|messages?) (?:about|regarding|with subject) (.+)/);
+    const fromMatch    = lower.match(/(?:find|search|look for|show)(?: for)? (?:emails?|messages?) (?:from|by) (.+)/);
+    const aboutMatch   = lower.match(/(?:find|search|look for|show)(?: for)? (?:emails?|messages?) (?:about|regarding|with subject) (.+)/);
     const generalMatch = lower.match(/(?:find|search)(?: for)? (.+?) (?:emails?|messages?)/);
     if (fromMatch)    { await handleSearchEmails(`from:${fromMatch[1].trim()}`);  return; }
     if (aboutMatch)   { await handleSearchEmails(aboutMatch[1].trim());            return; }
@@ -563,6 +656,14 @@ export default function CDAssistant({
     }
     if (/summari[sz]e (my )?(latest|newest|last|this)? ?(email|message|mail)?/.test(lower)) {
       await handleSummarizeEmail(); return;
+    }
+
+    // ── AI reply suggestion ──────────────────────────────────────────────────
+    if (/suggest a reply|draft a reply|ai reply|write a reply|generate a reply/.test(lower)) {
+      const sNumMap = { one:1, first:1, two:2, to:2, too:2, second:2, three:3, third:3, tree:3, four:4, for:4, fourth:4, five:5, fifth:5, file:5 };
+      const sNumMatch = lower.match(/(?:email\s+|message\s+)?(?:number\s+)?(\d+|one|two|to|too|three|tree|four|for|five|file|first|second|third|fourth|fifth)\b/);
+      const num = sNumMatch ? (sNumMap[sNumMatch[1]] || parseInt(sNumMatch[1])) : null;
+      await handleSuggestReply(num && num >= 1 && num <= 5 ? num : null); return;
     }
 
     // ── Reply ────────────────────────────────────────────────────────────────
@@ -623,6 +724,7 @@ export default function CDAssistant({
   // ── Multi-step conversation (email compose flow) ──────────────────────────
 const handleConversationStep = async (text, alternatives = []) => {
     const ctx = convCtxRef.current;
+    ctx.alternatives = alternatives;
     updateMode(MODE.SPEAKING);
 
     // ── Escape commands ───────────────────────────────────────────────────────
@@ -648,70 +750,54 @@ const handleConversationStep = async (text, alternatives = []) => {
     }
 
     // ── compose_to_username ───────────────────────────────────────────────────
-    if (ctx.step === 'compose_to_username') {
-      // Try all alternatives, pick the longest valid username
-      const parseUsername = (raw) =>
-        raw.toLowerCase().trim()
-          .replace(/\s+dot\s+/g, '.').replace(/\bdot\b/g, '.')
-          .replace(/\s+underscore\s+/g, '_').replace(/\bunderscore\b/g, '_')
-          .replace(/\s+dash\s+/g, '-').replace(/\bdash\b/g, '-')
-          .replace(/\s+/g, '').replace(/[^a-z0-9._+\-]/g, '');
+    // ── compose_recipient ────────────────────────────────────────────────────
+    if (ctx.step === 'compose_recipient') {
+      const matched = matchContact(text);
 
-      const allAlts = [text, ...alternatives].map(parseUsername).filter(Boolean);
-      const username = allAlts.sort((a, b) => b.length - a.length)[0] || '';
-
-      if (!username) {
-        const attempts = (ctx.data.usernameAttempts || 0) + 1;
-        if (attempts >= 2) {
-          convCtxRef.current = { step: null, data: {} };
-          const msg = "Having trouble with that. Compose cancelled — say compose an email to try again.";
-          addLog('cd', msg); await speak(msg); return;
-        }
-        convCtxRef.current = { step: 'compose_to_username', data: { ...ctx.data, usernameAttempts: attempts } };
-        const msg = "I didn't catch that. What is the username — the part before the at symbol?";
-        addLog('cd', msg); await speak(msg); return;
+      if (matched) {
+        const spoken = matched.email.replace('@', ' at ').replace(/\./g, ' dot ');
+        convCtxRef.current = { step: 'compose_recipient_confirm', data: { to: matched.email, fromName: matched.name }, alternatives: [] };
+        const msg = `Found ${matched.name}, at ${spoken}. Is that right? Say correct, or say a different name.`;
+        addLog('cd', msg); updateMode(MODE.SPEAKING); await speak(msg);
+        return;
       }
 
-      convCtxRef.current = { step: 'compose_to_domain', data: { username } };
-      const spokenBack = username.replace(/\./g, ' dot ').replace(/_/g, ' underscore ').replace(/-/g, ' dash ');
-      const msg = `Got it — ${spokenBack}. What is the domain? For example: gmail dot com, or outlook dot com.`;
-      addLog('cd', msg); await speak(msg);
-
-    // ── compose_to_domain ─────────────────────────────────────────────────────
-    } else if (ctx.step === 'compose_to_domain') {
-      const domain = text.toLowerCase().trim()
-        .replace(/\s+dot\s+/g, '.').replace(/\bdot\b/g, '.')
-        .replace(/\s+period\s+/g, '.').replace(/\s*\.\s*/g, '.')
-        .replace(/\s+/g, '').replace(/[^a-z0-9.\-]/g, '');
-
-      if (!domain || !domain.includes('.')) {
-        const attempts = (ctx.data.domainAttempts || 0) + 1;
-        if (attempts >= 2) {
-          convCtxRef.current = { step: null, data: {} };
-          const msg = "Having trouble with that. Compose cancelled — say compose an email to try again.";
-          addLog('cd', msg); await speak(msg); return;
+      updateMode(MODE.PROCESSING);
+      try {
+        const { data } = await api.post('/voice/parse-email', { speech: text });
+        if (data.success && data.email) {
+          const spoken = data.email.replace('@', ' at ').replace(/\./g, ' dot ');
+          convCtxRef.current = { step: 'compose_recipient_confirm', data: { to: data.email, fromName: '' }, alternatives: [] };
+          const msg = `Got it, ${spoken}. Is that right? Say correct, or say a different name or email.`;
+          addLog('cd', msg); updateMode(MODE.SPEAKING); await speak(msg);
+          return;
         }
-        convCtxRef.current = { step: 'compose_to_domain', data: { ...ctx.data, domainAttempts: attempts } };
-        const msg = "That doesn't look like a valid domain. Try saying gmail dot com or outlook dot com.";
+      } catch { /* fall through to retry */ }
+
+      const attempts = (ctx.data.recipientAttempts || 0) + 1;
+      updateMode(MODE.SPEAKING);
+      if (attempts >= 2) {
+        convCtxRef.current = { step: null, data: {} };
+        const msg = "I couldn't find that contact. Compose cancelled — say compose an email to try again.";
         addLog('cd', msg); await speak(msg); return;
       }
-
-      const { username } = ctx.data;
-      const fullEmail  = `${username}@${domain}`;
-      const spokenForm = `${username.replace(/\./g, ' dot ')} at ${domain.replace(/\./g, ' dot ')}`;
-      convCtxRef.current = { step: 'compose_to_confirm', data: { to: fullEmail } };
-      const msg = `The email address is ${spokenForm}. Is that correct? Say yes or no.`;
+      convCtxRef.current = { step: 'compose_recipient', data: { recipientAttempts: attempts } };
+      const msg = "I couldn't find that contact or understand that email. Try saying their name, or spell out the email address.";
       addLog('cd', msg); await speak(msg);
 
-    // ── compose_to_confirm ────────────────────────────────────────────────────
-    } else if (ctx.step === 'compose_to_confirm') {
-      if (/yes|yeah|yep|correct|right|sure|confirm|absolutely/.test(text)) {
-        convCtxRef.current = { step: 'compose_subject', data: { ...ctx.data } };
-        const msg = "What is the subject of this email?";
+    // ── compose_recipient_confirm ────────────────────────────────────────────
+    } else if (ctx.step === 'compose_recipient_confirm') {
+      const yesPattern = /\b(yes|yeah|yep|yup|correct|right|sure|confirm|confirmed|absolutely)\b/;
+      const allHeard = [text, ...(ctx.alternatives || [])].map((t) => t.trim());
+      const heardYes = allHeard.some((t) => yesPattern.test(t));
+
+      if (heardYes) {
+        convCtxRef.current = { step: 'compose_subject', data: { to: ctx.data.to } };
+        const msg = "What is the subject?";
         addLog('cd', msg); await speak(msg);
       } else {
-        convCtxRef.current = { step: 'compose_to_username', data: {} };
-        const msg = "No problem. What is the recipient's username?";
+        convCtxRef.current = { step: 'compose_recipient', data: {} };
+        const msg = "Okay, who would you like to email instead?";
         addLog('cd', msg); await speak(msg);
       }
 
@@ -726,12 +812,12 @@ const handleConversationStep = async (text, alternatives = []) => {
       const { to, subject } = ctx.data;
       convCtxRef.current = { step: 'compose_confirm', data: { ...ctx.data, body: text } };
       const toSpoken = to.replace('@', ' at ').replace(/\./g, ' dot ');
-      const msg = `Ready to send. To: ${toSpoken}. Subject: ${subject}. Message: ${text}. Shall I send it? Say yes or no.`;
+      const msg = `Ready to send. To: ${toSpoken}. Subject: ${subject}. Message: ${text}. Shall I send it? Say send it, or say no.`;
       addLog('cd', msg); await speak(msg);
 
     // ── compose_confirm ───────────────────────────────────────────────────────
     } else if (ctx.step === 'compose_confirm') {
-      if (/yes|send|confirm|go ahead|do it|yep|yeah|sure|absolutely/.test(text)) {
+      if (/yes|send|confirm|go ahead|do it|yep|yeah|sure|absolutely|proceed/.test(text)) {
         const { to, subject, body } = ctx.data;
         convCtxRef.current = { step: null, data: {} };
         updateMode(MODE.PROCESSING);
@@ -755,11 +841,38 @@ const handleConversationStep = async (text, alternatives = []) => {
     } else if (ctx.step === 'reply_body') {
       convCtxRef.current = { step: 'reply_confirm', data: { ...ctx.data, body: text } };
       const toSpoken = (ctx.data.fromName || ctx.data.to);
-      const msg = `Ready to reply to ${toSpoken}. Message: ${text}. Send it? Say yes or no.`;
+      const msg = `Ready to reply to ${toSpoken}. Message: ${text}. Send it? Say send it, or say no.`;
       addLog('cd', msg); await speak(msg);
+    }
 
+    // ── ai_reply_confirm ──────────────────────────────────────────────────────
+     else if (ctx.step === 'ai_reply_confirm') {
+      if (/^(send|yes|confirm|go ahead|do it|yep|yeah|sure|absolutely|proceed)$/.test(text.trim())) {
+        const { to, subject, draft, messageId, threadId } = ctx.data;
+        convCtxRef.current = { step: null, data: {} };
+        updateMode(MODE.PROCESSING);
+        try {
+          await gmailApi.replyEmail({ to, subject, body: draft, messageId, threadId });
+          updateMode(MODE.SPEAKING);
+          const msg = "Your reply has been sent!";
+          addLog('cd', msg); await speak(msg);
+        } catch {
+          updateMode(MODE.SPEAKING);
+          const msg = "Sorry, I couldn't send the reply.";
+          addLog('cd', msg); await speak(msg);
+        }
+      } else if (/own|my own|different|custom|something else/.test(text)) {
+        convCtxRef.current = { step: 'reply_body', data: { ...ctx.data } };
+        const msg = "Sure, what would you like to say instead?";
+        addLog('cd', msg); await speak(msg);
+      } else {
+        convCtxRef.current = { step: null, data: {} };
+        const msg = "Reply cancelled.";
+        addLog('cd', msg); await speak(msg);
+      }
+    }
     // ── reply_confirm ─────────────────────────────────────────────────────────
-    } else if (ctx.step === 'reply_confirm') {
+     else if (ctx.step === 'reply_confirm') {
       if (/yes|send|confirm|go ahead|do it|yep|yeah|sure|absolutely|proceed/.test(text)) {
         const { to, subject, body, messageId, threadId } = ctx.data;
         convCtxRef.current = { step: null, data: {} };
@@ -832,11 +945,12 @@ const handleConversationStep = async (text, alternatives = []) => {
 
       for (let i = 0; i < Math.min(3, emails.length); i++) {
         const e       = emails[i];
-        const from    = cleanFrom(e.from);
+        const from    = digitsToSpaced(cleanFrom(e.from));
         const subject = stripEmoji(e.subject).substring(0, 60);
-        const line    = `${i + 1}: From ${from}. ${subject}.`;
-        addLog('cd', line);
-        await speak(line);
+        addLog('cd', `${i + 1}: From ${from}. ${subject}.`);
+        await speak(`${i + 1}: From ${from}.`);
+        if (stopSpeakingRef.current) return;
+        await speak(subject + '.');
         if (stopSpeakingRef.current) return;
       }
 
@@ -863,7 +977,7 @@ const handleConversationStep = async (text, alternatives = []) => {
         addLog('cd', msg); updateMode(MODE.SPEAKING); await speak(msg); return;
       }
       const { email } = await gmailApi.getEmail(emails[0].id);
-      const from    = email.from.replace(/<[^>]+>/g, '').replace(/"/g, '').trim() || email.from;
+      const from    = digitsToSpaced(email.from.replace(/<[^>]+>/g, '').replace(/"/g, '').trim() || email.from);
       const subject = email.subject.replace(/[^\x00-\x7F]/g, '').trim();
 
       // Strip URLs — fall back to snippet if body is mostly links
@@ -910,7 +1024,7 @@ const handleConversationStep = async (text, alternatives = []) => {
     updateMode(MODE.PROCESSING);
     try {
       const { email } = await gmailApi.getEmail(inboxCacheRef.current[idx].id);
-      const from      = email.from.replace(/<[^>]+>/g, '').replace(/"/g, '').trim() || email.from;
+      const from      = digitsToSpaced(email.from.replace(/<[^>]+>/g, '').replace(/"/g, '').trim() || email.from);
       const subject   = email.subject.replace(/[^\x00-\x7F]/g, '').trim();
       const stripUrls = (t) => t.replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim();
       const cleanBody = stripUrls(email.body || '');
@@ -965,6 +1079,27 @@ const handleConversationStep = async (text, alternatives = []) => {
     return sentences.slice(0, 4).join(' ').substring(0, 400) || clean.substring(0, 350);
   };
 
+  const digitsToSpaced = (text) => text.replace(/\d{4,}/g, (m) => m.split('').join(' '));
+
+  const STOPWORDS = new Set(['from','via','team','support','noreply','no','reply','the','and','inc','llc','official']);
+  const normalizeNameText = (t) => t.toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const meaningfulWords = (t) => normalizeNameText(t).split(' ').filter((w) => w.length >= 2 && !STOPWORDS.has(w));
+
+  const matchContact = (spokenText) => {
+    const spokenWords = meaningfulWords(spokenText);
+    if (spokenWords.length === 0) return null;
+    let best = null, bestScore = 0;
+    for (const c of contactsRef.current) {
+      const cWords = meaningfulWords(c.name);
+      if (cWords.length === 0) continue;
+      const overlap = cWords.filter((w) => spokenWords.includes(w)).length;
+      if (overlap === 0) continue;
+      const score = overlap / cWords.length;
+      if (score > bestScore) { bestScore = score; best = c; }
+    }
+    return bestScore >= 0.4 ? best : null;
+  };
+
   const extractEmailAddress = (from) => {
     const m = from.match(/<([^>]+)>/);
     return m ? m[1] : from.trim();
@@ -1009,7 +1144,7 @@ const handleConversationStep = async (text, alternatives = []) => {
     updateMode(MODE.PROCESSING);
     try {
       const { email } = await gmailApi.getEmail(emailId);
-      const from      = email.from.replace(/<[^>]+>/g, '').replace(/"/g, '').trim();
+      const from      = digitsToSpaced(email.from.replace(/<[^>]+>/g, '').replace(/"/g, '').trim());
       const subject   = email.subject.replace(/[^\x00-\x7F]/g, '').trim();
       const stripUrls = (t) => t.replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim();
       const body      = stripUrls(email.body || email.snippet || '');
@@ -1122,10 +1257,12 @@ const handleConversationStep = async (text, alternatives = []) => {
 
       for (let i = 0; i < Math.min(3, emails.length); i++) {
         const e       = emails[i];
-        const from    = cleanFrom(e.from);
+        const from    = digitsToSpaced(cleanFrom(e.from));
         const subject = stripEmoji(e.subject).substring(0, 60);
-        const line    = `${i + 1}: From ${from}. ${subject}.`;
-        addLog('cd', line); await speak(line);
+        addLog('cd', `${i + 1}: From ${from}. ${subject}.`);
+        await speak(`${i + 1}: From ${from}.`);
+        if (stopSpeakingRef.current) return;
+        await speak(subject + '.');
         if (stopSpeakingRef.current) return;
       }
 
@@ -1136,6 +1273,52 @@ const handleConversationStep = async (text, alternatives = []) => {
     } catch {
       const msg = "Sorry, I couldn't complete the search. Please try again.";
       addLog('cd', msg); updateMode(MODE.SPEAKING); await speak(msg);
+    }
+  };
+
+  const handleSuggestReply = async (emailNum = null) => {
+    if (!gmailRef.current.connected) {
+      const msg = "Your Gmail is not connected.";
+      addLog('cd', msg); await speak(msg); return;
+    }
+    let emailId = null;
+    if (emailNum !== null) {
+      if (inboxCacheRef.current.length === 0) {
+        const msg = "Say read my inbox first so I know which emails you have.";
+        addLog('cd', msg); await speak(msg); return;
+      }
+      const idx = emailNum - 1;
+      if (idx < 0 || idx >= inboxCacheRef.current.length) {
+        const msg = `I only have ${inboxCacheRef.current.length} emails listed.`;
+        addLog('cd', msg); await speak(msg); return;
+      }
+      emailId = inboxCacheRef.current[idx].id;
+    } else if (lastReadEmailRef.current?.id) {
+      emailId = lastReadEmailRef.current.id;
+    } else {
+      const msg = "Please read or select an email first.";
+      addLog('cd', msg); await speak(msg); return;
+    }
+
+    updateMode(MODE.PROCESSING);
+    addLog('cd', "Thinking of a reply...");
+    try {
+      const { draft, to, subject, messageId, threadId } = await gmailApi.suggestReply(emailId);
+      const extractedTo = extractEmailAddress(to);
+      const fromName    = to.replace(/<[^>]+>/g, '').replace(/"/g, '').trim();
+
+      convCtxRef.current = {
+        step: 'ai_reply_confirm',
+        data: { draft, to: extractedTo, subject, messageId, threadId, fromName },
+      };
+
+      updateMode(MODE.SPEAKING);
+      const msg = `Here's a suggested reply: ${draft}. Should I send this, or would you like to say your own message instead? Say send, or say my own.`;
+      addLog('cd', msg); await speak(msg);
+    } catch {
+      updateMode(MODE.SPEAKING);
+      const msg = "Sorry, I couldn't generate a reply suggestion.";
+      addLog('cd', msg); await speak(msg);
     }
   };
 
@@ -1190,8 +1373,8 @@ const handleConversationStep = async (text, alternatives = []) => {
       const msg = "Your Gmail is not connected. Please connect Gmail first.";
       addLog('cd', msg); await speak(msg); return;
     }
-    convCtxRef.current = { step: 'compose_to_username', data: {} };
-    const msg = "Sure! What is the recipient's username — the part before the at symbol? Say dot for a period, dash for a hyphen.";
+    convCtxRef.current = { step: 'compose_recipient', data: {} };
+    const msg = "Sure! Who would you like to email? Say their name, or their full email address.";
     addLog('cd', msg); await speak(msg);
   };
 

@@ -451,4 +451,110 @@ router.delete('/delete/:id', protect, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/gmail/suggest-reply/:id
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/suggest-reply/:id', protect, async (req, res) => {
+  try {
+    const gmail  = await getGmailClient(req.user._id);
+    const detail = await gmail.users.messages.get({ userId: 'me', id: req.params.id, format: 'full' });
+
+    const headers = detail.data.payload?.headers || [];
+    const get     = (name) => headers.find((h) => h.name === name)?.value || '';
+    const body    = extractPlainText(detail.data.payload).replace(/\s+/g, ' ').trim().substring(0, 2000);
+    const subject = get('Subject') || '(No subject)';
+    const from    = get('From');
+    const userName = req.user.name || 'the user';
+
+    const prompt = `You are helping ${userName} reply to an email.
+From: ${from}
+Subject: ${subject}
+Body: ${body}
+
+Write a short, natural reply (2-3 sentences max). Do not include "Dear", "Hi", "Best regards" or any greeting/signature — just the core message, since this will be read aloud and sent as-is. Respond with ONLY the reply text.`;
+
+    const aiResp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 200,
+      }),
+    });
+
+    const data  = await aiResp.json();
+    console.log('Groq API status:', aiResp.status);
+    console.log('Groq API response:', JSON.stringify(data));
+    const draft = data?.choices?.[0]?.message?.content?.trim() || '';
+
+    if (!draft) return res.status(500).json({ success: false, message: 'Could not generate a reply.' });
+    res.json({ success: true, draft, to: from, subject, messageId: get('Message-ID'), threadId: detail.data.threadId });
+  } catch (err) {
+    console.error('Suggest reply error:', err);
+    res.status(500).json({ success: false, message: 'Failed to generate reply suggestion.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/gmail/contacts  →  Build a name→email lookup from recent mail
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/contacts', protect, async (req, res) => {
+  try {
+    const gmail = await getGmailClient(req.user._id);
+
+    const parseHeader = (raw) => {
+      if (!raw) return null;
+      const m = raw.match(/^"?([^"<]*)"?\s*<([^>]+)>$/);
+      if (m) {
+        const name  = m[1].trim();
+        const email = m[2].trim().toLowerCase();
+        return { name: name || email.split('@')[0], email };
+      }
+      const email = raw.trim().toLowerCase();
+      return { name: email.split('@')[0], email };
+    };
+
+    const collectFrom = async (labelIds, headerName, maxResults) => {
+      const list = await gmail.users.messages.list({ userId: 'me', labelIds, maxResults });
+      const messages = list.data.messages || [];
+      const results = await Promise.all(
+        messages.map(async (msg) => {
+          const detail = await gmail.users.messages.get({
+            userId: 'me', id: msg.id, format: 'metadata', metadataHeaders: [headerName],
+          });
+          const headers = detail.data.payload?.headers || [];
+          const raw = headers.find((h) => h.name === headerName)?.value || '';
+          return parseHeader(raw);
+        })
+      );
+      return results.filter(Boolean);
+    };
+
+    const [fromInbox, fromSent] = await Promise.all([
+      collectFrom(['INBOX'], 'From', 100),
+      collectFrom(['SENT'], 'To', 60),
+    ]);
+
+    const map = new Map();
+    [...fromInbox, ...fromSent].forEach(({ name, email }) => {
+      if (!map.has(email) || name.length > map.get(email).name.length) {
+        map.set(email, { name, email });
+      }
+    });
+
+    const contacts = Array.from(map.values());
+
+    res.json({ success: true, contacts });
+  } catch (err) {
+    if (err.message === 'Gmail not connected')
+      return res.status(400).json({ success: false, message: 'Gmail not connected.' });
+    console.error('Contacts error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch contacts.' });
+  }
+});
+
 module.exports = router;
